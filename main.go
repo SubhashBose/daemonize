@@ -149,11 +149,22 @@ func main() {
 
 	opts, target := parseOptions(target)
 	if len(target) == 0 {
-		usage()
+		if opts.jobName == "" {
+			fmt.Fprintf(os.Stderr, "daemonize: missing target program\n\n")
+			usage()
+		}
+		switch os.Args[1] {
+		case "start", "watch-start":
+			fmt.Fprintf(os.Stderr, "daemonize: missing target program\n\n")
+			usage()
+		default:
+			target = []string{"Job " + opts.jobName}
+		}
 	}
 
 	const hashSalt = "&sZV2GP8AHyKoLnvj1CJ"
 	var hashKey string
+	var pidfilePrefix string
 	if opts.jobName == "" {
 		// If the job name is not specified, use the target program path.
 		// The PID file is keyed on uid + cwd + the resolved target program path
@@ -167,12 +178,14 @@ func main() {
 		}
 		cwd, _ := os.Getwd()
 		hashKey = cwd + "|" + progPath
+		pidfilePrefix = filepath.Base(target[0])
 	} else {
 		hashKey = opts.jobName
+		pidfilePrefix = opts.jobName
 	}
 	daemon.Handle(daemon.Config{
 		AppName:              filepath.Base(target[0]),
-		PidfilePrefix:        filepath.Base(target[0]),
+		PidfilePrefix:        pidfilePrefix,
 		HashKey:              hashKey,
 		HashSalt:             hashSalt,
 		RestartOnCleanExit:   opts.restartOnCleanExit,

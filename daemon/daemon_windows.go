@@ -28,6 +28,9 @@ type Config struct {
 	//HashKey to be used for the PID file. Default is current working directory
 	HashKey string
 
+	//HashSalt to be used for the PID filename. Default is a fixed arbitrary value
+	HashSalt string
+
 	// WaitAfterStart is how long to wait after forking before confirming the
 	// daemon is still alive. Defaults to 500ms.
 	WaitAfterStart time.Duration

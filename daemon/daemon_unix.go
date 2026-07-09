@@ -311,7 +311,7 @@ func forkDaemon(exe string, args []string, env []string, cfg *Config) int {
 }
 
 func handleStart(childArgs []string, cfg *Config) {
-	if pid, _, err := readPID(cfg.pidFile); err == nil {
+	if pid, _, _, err := readPID(cfg.pidFile); err == nil {
 		if processExists(pid) {
 			fmt.Printf("%s already running (PID %d). Use 'stop' first.\n", cfg.AppName, pid)
 			os.Exit(0)
@@ -328,7 +328,7 @@ func handleStart(childArgs []string, cfg *Config) {
 	env := append(os.Environ(), pidFileEnvVar+"="+cfg.pidFile)
 	pid := forkDaemon(exe, childArgs, env, cfg)
 
-	if err := writePID(cfg.pidFile, pid, "start"); err != nil {
+	if err := writePID(cfg.pidFile, pid, cfg.AppName, "start"); err != nil {
 		cfg.logger.Fatalf("%s: failed to write PID file: %v", cfg.AppName, err)
 	}
 	fmt.Printf("%s daemon started (PID %d)\n", cfg.AppName, pid)
@@ -336,7 +336,7 @@ func handleStart(childArgs []string, cfg *Config) {
 }
 
 func handleWatchStart(childArgs []string, cfg *Config) {
-	if pid, _, err := readPID(cfg.pidFile); err == nil {
+	if pid, _, _, err := readPID(cfg.pidFile); err == nil {
 		if processExists(pid) {
 			fmt.Printf("%s already running (PID %d). Use 'stop' first.\n", cfg.AppName, pid)
 			os.Exit(0)
@@ -356,7 +356,7 @@ func handleWatchStart(childArgs []string, cfg *Config) {
 	)
 	pid := forkDaemon(exe, childArgs, env, cfg)
 
-	if err := writePID(cfg.pidFile, pid, "watch-start"); err != nil {
+	if err := writePID(cfg.pidFile, pid, cfg.AppName, "watch-start"); err != nil {
 		cfg.logger.Fatalf("%s: failed to write PID file: %v", cfg.AppName, err)
 	}
 	fmt.Printf("%s watchdog started (PID %d)\n", cfg.AppName, pid)
@@ -481,7 +481,10 @@ func runWatchdog(cfg *Config) {
 }
 
 func handleStop(cfg *Config) bool {
-	pid, _, err := readPID(cfg.pidFile)
+	pid, appname, _, err := readPID(cfg.pidFile)
+	if appname != "" {
+		cfg.AppName = appname
+	}
 	if err != nil {
 		fmt.Printf("%s is not running.\n", cfg.AppName)
 		return false
@@ -521,6 +524,11 @@ func handleRestart(fallbackArgs []string, cfg *Config) {
 	// survives (the normal case) output stays synchronous and the command
 	// blocks until the restart is done. When the terminal dies, the foreground
 	// is killed but the detached child — in its own session — finishes anyway.
+	pid, appname, mode, _ := readPID(cfg.pidFile)
+	if appname != "" {
+		cfg.AppName = appname
+	}
+
 	if os.Getenv(restartDetachedEnvVar) != "1" {
 		exe, _ := filepath.Abs(mustExecutable())
 		cmd := exec.Command(exe, os.Args[1:]...)
@@ -538,7 +546,6 @@ func handleRestart(fallbackArgs []string, cfg *Config) {
 	// Don't leak the marker into the restarted daemon or the target program.
 	os.Unsetenv(restartDetachedEnvVar)
 
-	pid, mode, _ := readPID(cfg.pidFile)
 	if mode == "" {
 		mode = "start" // fallback
 	}
@@ -570,7 +577,10 @@ func handleRestart(fallbackArgs []string, cfg *Config) {
 }
 
 func handleReload(cfg *Config) {
-	pid, _, err := readPID(cfg.pidFile)
+	pid, appname, _, err := readPID(cfg.pidFile)
+	if appname != "" {
+		cfg.AppName = appname
+	}
 	if err != nil {
 		fmt.Printf("%s is not running.\n", cfg.AppName)
 		return
@@ -599,7 +609,10 @@ func handleStatus(cfg *Config) {
 		tailFile(cfg.LoggerFile, 10)
 	}
 
-	pid, mode, err := readPID(cfg.pidFile)
+	pid, appname, mode, err := readPID(cfg.pidFile)
+	if appname != "" {
+		cfg.AppName = appname
+	}
 	if err != nil {
 		fmt.Printf("Status: %s stopped\n", cfg.AppName)
 		return
@@ -686,25 +699,29 @@ func mustExecutable() string {
 	return exe
 }
 
-func writePID(path string, pid int, mode string) error {
-	return os.WriteFile(path, []byte(strconv.Itoa(pid)+"\n"+mode+"\n"), 0644)
+func writePID(path string, pid int, appname, mode string) error {
+	return os.WriteFile(path, []byte(strconv.Itoa(pid)+"\n"+appname+"\n"+mode+"\n"), 0644)
 }
 
-func readPID(path string) (int, string, error) {
+func readPID(path string) (int, string, string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return 0, "", err
+		return 0, "", "", err
 	}
-	lines := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)
+	lines := strings.SplitN(strings.TrimSpace(string(data)), "\n", 3)
 	pid, err := strconv.Atoi(strings.TrimSpace(lines[0]))
 	if err != nil {
-		return 0, "", err
+		return 0, "", "", err
+	}
+	var appname string
+	if len(lines) > 1 {
+		appname = strings.TrimSpace(lines[1])
 	}
 	mode := "start" // default for old PID files that don't have mode
-	if len(lines) > 1 {
-		mode = strings.TrimSpace(lines[1])
+	if len(lines) > 2 {
+		mode = strings.TrimSpace(lines[2])
 	}
-	return pid, mode, nil
+	return pid, appname, mode, nil
 }
 
 // processExists checks whether a process with the given PID is alive.
