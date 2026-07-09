@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -135,7 +136,7 @@ func Handle(cfg Config) {
 			cfg.PidfilePrefix = filepath.Base(exe)
 		}
 		if cfg.HashSalt == "" {
-			cfg.HashSalt = "5Ud@wsPAoTXLbAWdvDC6"
+			cfg.HashSalt = defaultHashSalt()
 		}
 		if cfg.WaitAfterStart == 0 {
 			cfg.WaitAfterStart = 500 * time.Millisecond
@@ -251,6 +252,19 @@ func parseArgs(args []string, commandStrings *Commands) (command string, rest []
 		}
 	}
 	return "", args
+}
+
+// defaultHashSalt derives a per-application salt so that different programs
+// importing this package don't collide on PID file names when they share a
+// job or program name. It uses the main module path of the final binary —
+// which is always the importing application, not this package — falling back
+// to a fixed constant for non-module builds where build info is unavailable.
+// Callers can override it by setting Config.HashSalt explicitly.
+func defaultHashSalt() string {
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Path != "" {
+		return bi.Main.Path
+	}
+	return "5Ud@wsPAoTXLbAWdvDC6"
 }
 
 func pidFilePath(cfg Config) (string, error) {

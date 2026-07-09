@@ -5,7 +5,13 @@ management, status/stop/restart control, and an optional auto-restarting
 watchdog. The daemonizing logic is adapted from
 [RouteMUX/daemon](https://github.com/SubhashBose/RouteMUX/tree/master/daemon).
 
-## Build
+## Install
+
+```sh
+go install github.com/SubhashBose/daemonize@latest
+```
+
+Or build from a clone:
 
 ```sh
 go build -o daemonize .
@@ -73,16 +79,31 @@ the program name — run them from the same directory you started from.
 The PID file's second line records the mode (`start` / `watch-start`) so
 `restart` knows which mode to relaunch in.
 
+## Reusing the daemon package
+
+The daemonizing logic lives in an importable package:
+
+```go
+import "github.com/SubhashBose/daemonize/daemon"
+```
+
+It handles start/stop/watch-start/restart/reload/status, PID-file management,
+and graceful shutdown for any Go program — put your program logic in
+`Config.OnStart`. PID files are namespaced per application automatically: the
+salt defaults to the importing binary's module path, so two programs using
+this package won't collide on the same job or program name. Override
+`Config.HashSalt` to set it explicitly.
+
 ## Layout
 
-- `daemon/` — the daemonizing package from RouteMUX, with small adaptations:
-  the control command must be the first argument (so target args like `stop`
-  are never misparsed), `stop` removes the PID file (an exec()ed target
-  can't), and `restart` understands that a plain daemon's argv *is* the
-  target command.
-- `main.go`, `target_unix.go` — CLI wrapper; in the final child role it
-  `exec()`s the target program so signals and the PID file refer to the
-  target itself.
+- `daemon/` — the importable daemonizing package, adapted from RouteMUX with
+  small changes: the control command must be the first argument (so target
+  args like `stop` are never misparsed), `stop` removes the PID file (an
+  exec()ed target can't), and `restart` understands that a plain daemon's
+  argv *is* the target command.
+- module root (`main.go`, `target_unix.go`, …) — the CLI wrapper; in the final
+  child role it `exec()`s the target program so signals and the PID file refer
+  to the target itself.
 
 Unix only; on Windows it runs the program attached to the terminal
 (matching the upstream package's behavior).

@@ -21,7 +21,7 @@ import (
 	"strings"
 	"time"
 
-	"daemonize/daemon"
+	"github.com/SubhashBose/daemonize/daemon"
 )
 
 // Role-marker env vars, must match the daemon package's internal constants.
@@ -162,7 +162,6 @@ func main() {
 		}
 	}
 
-	const hashSalt = "&sZV2GP8AHyKoLnvj1CJ"
 	var hashKey string
 	var pidfilePrefix string
 	if opts.jobName == "" {
@@ -184,10 +183,12 @@ func main() {
 		pidfilePrefix = opts.jobName
 	}
 	daemon.Handle(daemon.Config{
-		AppName:              filepath.Base(target[0]),
-		PidfilePrefix:        pidfilePrefix,
-		HashKey:              hashKey,
-		HashSalt:             hashSalt,
+		AppName:       filepath.Base(target[0]),
+		PidfilePrefix: pidfilePrefix,
+		HashKey:       hashKey,
+		// HashSalt left empty: the daemon package defaults it to this binary's
+		// module path, which namespaces our PID files from other programs
+		// that import the package.
 		RestartOnCleanExit:   opts.restartOnCleanExit,
 		WatchdogRestartDelay: opts.watchRestartDelay,
 		OnStart:              func() { runTarget(target) },
