@@ -46,9 +46,19 @@ type Config struct {
 	// Defaults to same as Logger if it is set, otherwise log file is PID-file basename with "-watchdog.log".
 	WatchdogLoggerFile string
 
+	// DaemonOutputLog indicates a plain daemon redirects stdout/stderr to a
+	// per-daemon output log. Daemonizing is unsupported on Windows, so this
+	// field exists only for API compatibility with the Unix build.
+	DaemonOutputLog bool
+
 	// Restart (when watch-start) worker on clean exit too. Default is restart on error only
 	// Default value false.
 	RestartOnCleanExit bool
+
+	// CommandMustBeFirst restricts the control command to the first argument.
+	// Daemonizing is unsupported on Windows, so this field exists only for
+	// API compatibility with the Unix build.
+	CommandMustBeFirst bool
 
 	// (internal variables) Logger is used for daemon-internal messages. Defaults to log.Default().
 	logger *log.Logger

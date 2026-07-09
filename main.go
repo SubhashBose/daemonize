@@ -186,6 +186,11 @@ func main() {
 		AppName:       filepath.Base(target[0]),
 		PidfilePrefix: pidfilePrefix,
 		HashKey:       hashKey,
+		// We wrap an arbitrary program, so the command must be args[0] —
+		// otherwise a target arg like "stop" could be taken as our command.
+		CommandMustBeFirst: true,
+		// runTarget redirects the target's stdout/stderr to <pidfile>.log.
+		DaemonOutputLog: true,
 		// HashSalt left empty: the daemon package defaults it to this binary's
 		// module path, which namespaces our PID files from other programs
 		// that import the package.

@@ -4,11 +4,16 @@
 // github.com/SubhashBose/RouteMUX/daemon.
 //
 // It handles start/stop/status commands, PID file management, and graceful
-// shutdown. Differences from the RouteMUX original (which self-daemonizes a
-// single Go program):
-//   - the control command must be the FIRST argument, so that arguments of
-//     the wrapped target program (which may themselves be words like "stop")
-//     are never misparsed;
+// shutdown. It remains API- and behavior-compatible with the RouteMUX
+// original (which self-daemonizes a single Go program) when used with the
+// zero-value Config: the control command is found by scanning from the end,
+// so it may follow the program's own flags.
+//
+// The package additionally supports wrapping an arbitrary external program
+// (see the daemonize command). Behaviors relevant to that mode:
+//   - Config.CommandMustBeFirst restricts the control command to the first
+//     argument, so a wrapped program's own arguments (which may themselves be
+//     words like "stop") are never misparsed;
 //   - restart re-reads the running process's full cmdline from /proc, taking
 //     into account that a plain daemon may have exec()ed into the target
 //     program (its argv IS the target command);
@@ -72,6 +77,14 @@ type Config struct {
 	// Defaults to same as LoggerFile if it is set, otherwise log file is PID-file basename with "-watchdog.log".
 	WatchdogLoggerFile string
 
+	// DaemonOutputLog, when true, redirects a plain daemon's stdout and stderr
+	// to a per-daemon output log at <pidfile>.log before running OnStart. The
+	// redirection is done at the file-descriptor level, so it is inherited by
+	// any program the daemon exec()s. 'start' then reports the log's path and
+	// 'status' tails it. Has no effect in watch-start mode, whose output is
+	// captured by the watchdog log instead. Default false.
+	DaemonOutputLog bool
+
 	// Restart (when watch-start) worker on clean exit too. Default is restart on error only
 	// Default value false.
 	RestartOnCleanExit bool
@@ -79,6 +92,19 @@ type Config struct {
 	// Command strings to be used for start/stop/restart/status commands.
 	// Defaults to "start", "watch-start", "stop", "restart", "reload", "status".
 	CommandStrings Commands
+
+	// CommandMustBeFirst controls where the control command may appear in the
+	// arguments.
+	//
+	// Default (false): the command is found by scanning from the end, so it may
+	// follow the program's own flags, e.g. "./app --config c.yml start". This
+	// suits a self-daemonizing program whose only arguments are its own.
+	//
+	// True: the command is only recognized as the first argument, e.g.
+	// "./app start --config c.yml". This is required when the arguments after
+	// the command belong to an arbitrary wrapped program, since those may
+	// themselves contain words like "stop".
+	CommandMustBeFirst bool
 
 	// Log and PID file modtime refresh interval to avoid OS cleaning up /tmp.
 	// Defaults to 12h.
@@ -180,8 +206,16 @@ func Handle(cfg Config) {
 	// Role: plain daemon — set up graceful shutdown and run OnStart.
 	if pidFile := os.Getenv(pidFileEnvVar); pidFile != "" {
 		setBasicDefaults()
-		initLogger()
 		cfg.pidFile = pidFile
+		if cfg.DaemonOutputLog {
+			logf := getDaemonLogfileName(&cfg)
+			if err := redirectStdOutErr(logf); err != nil {
+				cfg.logger.Printf("%s: failed to open output log %s: %v", cfg.AppName, logf, err)
+			} else {
+				refreshModTime(logf, cfg.TmpFileTouchInterval)
+			}
+		}
+		initLogger()
 		setupGracefulShutdown(&cfg, nil)
 		refreshModTime(cfg.pidFile, cfg.TmpFileTouchInterval)
 		if cfg.OnStart != nil {
@@ -200,7 +234,7 @@ func Handle(cfg Config) {
 	}
 
 	// Role: parent — parse command and act.
-	command, passArgs := parseArgs(os.Args[1:], &cfg.CommandStrings)
+	command, passArgs := parseArgs(os.Args[1:], &cfg.CommandStrings, cfg.CommandMustBeFirst)
 
 	handlers := map[string]func(){
 		cfg.CommandStrings.Start:      func() { handleStart(passArgs, &cfg) },
@@ -229,9 +263,12 @@ func Handle(cfg Config) {
 
 // ---- internal ---------------------------------------------------------------
 
-// parseArgs recognizes a control command only as the FIRST argument, so the
-// target program's own arguments are passed through untouched.
-func parseArgs(args []string, commandStrings *Commands) (command string, rest []string) {
+// parseArgs separates the control command from the rest of the arguments.
+// When mustBeFirst is true the command is only recognized as args[0] (so an
+// arbitrary wrapped program's own arguments are passed through untouched);
+// otherwise it is found by scanning from the end (so it may follow the
+// program's own flags).
+func parseArgs(args []string, commandStrings *Commands, mustBeFirst bool) (command string, rest []string) {
 	validCommands := make(map[string]struct{})
 	for _, cmd := range []string{
 		commandStrings.Start,
@@ -246,9 +283,22 @@ func parseArgs(args []string, commandStrings *Commands) (command string, rest []
 		}
 	}
 
-	if len(args) > 0 {
-		if _, ok := validCommands[args[0]]; ok {
-			return args[0], args[1:]
+	if mustBeFirst {
+		if len(args) > 0 {
+			if _, ok := validCommands[args[0]]; ok {
+				return args[0], args[1:]
+			}
+		}
+		return "", args
+	}
+
+	// Scan from the end: the last matching argument wins.
+	for i := len(args) - 1; i >= 0; i-- {
+		if _, ok := validCommands[args[i]]; ok {
+			rest = make([]string, 0, len(args)-1)
+			rest = append(rest, args[:i]...)
+			rest = append(rest, args[i+1:]...)
+			return args[i], rest
 		}
 	}
 	return "", args
@@ -325,7 +375,7 @@ func forkDaemon(exe string, args []string, env []string, cfg *Config) int {
 }
 
 func handleStart(childArgs []string, cfg *Config) {
-	if pid, _, _, err := readPID(cfg.pidFile); err == nil {
+	if pid, _, _, _, err := readPID(cfg.pidFile); err == nil {
 		if processExists(pid) {
 			fmt.Printf("%s already running (PID %d). Use 'stop' first.\n", cfg.AppName, pid)
 			os.Exit(0)
@@ -342,15 +392,17 @@ func handleStart(childArgs []string, cfg *Config) {
 	env := append(os.Environ(), pidFileEnvVar+"="+cfg.pidFile)
 	pid := forkDaemon(exe, childArgs, env, cfg)
 
-	if err := writePID(cfg.pidFile, pid, cfg.AppName, "start"); err != nil {
+	if err := writePID(cfg.pidFile, pid, cfg.AppName, "start", childArgs); err != nil {
 		cfg.logger.Fatalf("%s: failed to write PID file: %v", cfg.AppName, err)
 	}
 	fmt.Printf("%s daemon started (PID %d)\n", cfg.AppName, pid)
-	fmt.Printf("Output log: %s\n", getDaemonLogfileName(cfg))
+	if cfg.DaemonOutputLog {
+		fmt.Printf("Output log: %s\n", getDaemonLogfileName(cfg))
+	}
 }
 
 func handleWatchStart(childArgs []string, cfg *Config) {
-	if pid, _, _, err := readPID(cfg.pidFile); err == nil {
+	if pid, _, _, _, err := readPID(cfg.pidFile); err == nil {
 		if processExists(pid) {
 			fmt.Printf("%s already running (PID %d). Use 'stop' first.\n", cfg.AppName, pid)
 			os.Exit(0)
@@ -370,7 +422,7 @@ func handleWatchStart(childArgs []string, cfg *Config) {
 	)
 	pid := forkDaemon(exe, childArgs, env, cfg)
 
-	if err := writePID(cfg.pidFile, pid, cfg.AppName, "watch-start"); err != nil {
+	if err := writePID(cfg.pidFile, pid, cfg.AppName, "watch-start", childArgs); err != nil {
 		cfg.logger.Fatalf("%s: failed to write PID file: %v", cfg.AppName, err)
 	}
 	fmt.Printf("%s watchdog started (PID %d)\n", cfg.AppName, pid)
@@ -388,9 +440,25 @@ func getWatchdogLogfileName(cfg *Config) string {
 }
 
 // getDaemonLogfileName is the log file the plain (non-watchdog) daemon
-// redirects the target's stdout/stderr into before exec()ing it.
+// redirects its stdout/stderr into (see DaemonOutputLog).
 func getDaemonLogfileName(cfg *Config) string {
 	return strings.TrimSuffix(cfg.pidFile, ".pid") + ".log"
+}
+
+// redirectStdOutErr points the process's stdout and stderr (fds 1 and 2) at
+// the given file, creating it if needed and appending otherwise. Because it
+// operates at the file-descriptor level, the redirection survives exec(), so
+// output of a wrapped target program is captured too.
+func redirectStdOutErr(path string) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close() // fds 1 and 2 keep the file open after the original fd closes
+	if err := dup2(int(f.Fd()), 1); err != nil {
+		return err
+	}
+	return dup2(int(f.Fd()), 2)
 }
 
 func fileExists(path string) bool {
@@ -495,7 +563,7 @@ func runWatchdog(cfg *Config) {
 }
 
 func handleStop(cfg *Config) bool {
-	pid, appname, _, err := readPID(cfg.pidFile)
+	pid, appname, _, _, err := readPID(cfg.pidFile)
 	if appname != "" {
 		cfg.AppName = appname
 	}
@@ -538,7 +606,7 @@ func handleRestart(fallbackArgs []string, cfg *Config) {
 	// survives (the normal case) output stays synchronous and the command
 	// blocks until the restart is done. When the terminal dies, the foreground
 	// is killed but the detached child — in its own session — finishes anyway.
-	pid, appname, mode, _ := readPID(cfg.pidFile)
+	pid, appname, mode, storedArgs, _ := readPID(cfg.pidFile)
 	if appname != "" {
 		cfg.AppName = appname
 	}
@@ -564,12 +632,17 @@ func handleRestart(fallbackArgs []string, cfg *Config) {
 		mode = "start" // fallback
 	}
 
-	// Remember the args the running process was launched with so we can
-	// restart it with the same command line. For a plain daemon the process
-	// has exec()ed into the target, so its whole argv is the target command;
-	// for a watchdog, argv[0] is this executable and the rest is the target.
+	// Relaunch with the exact command the daemon was originally started with.
+	// We use the command recorded in the PID file rather than /proc/<pid>/cmdline,
+	// because the running process may have exec()ed into a different program
+	// (e.g. `bash -c "... ; sleep 500"` tail-calls into sleep), which would
+	// otherwise make us restart only that inner program.
 	passArgs := fallbackArgs
-	if pid != 0 {
+	if len(storedArgs) > 0 {
+		passArgs = storedArgs
+	} else if pid != 0 {
+		// Backward compatibility: PID files written before the command was
+		// recorded. Fall back to /proc (imperfect for the exec case above).
 		if args, err := getProcessArgs(pid); err == nil {
 			if mode == "watch-start" {
 				passArgs = args[1:]
@@ -591,7 +664,7 @@ func handleRestart(fallbackArgs []string, cfg *Config) {
 }
 
 func handleReload(cfg *Config) {
-	pid, appname, _, err := readPID(cfg.pidFile)
+	pid, appname, _, _, err := readPID(cfg.pidFile)
 	if appname != "" {
 		cfg.AppName = appname
 	}
@@ -615,7 +688,7 @@ func handleStatus(cfg *Config) {
 	if wg_logf := getWatchdogLogfileName(cfg); fileExists(wg_logf) {
 		fmt.Printf("Watchdog log: %s\n", wg_logf)
 		tailFile(wg_logf, 10)
-	} else if d_logf := getDaemonLogfileName(cfg); fileExists(d_logf) {
+	} else if d_logf := getDaemonLogfileName(cfg); cfg.DaemonOutputLog && fileExists(d_logf) {
 		fmt.Printf("Output log: %s\n", d_logf)
 		tailFile(d_logf, 10)
 	} else if cfg.LoggerFile != "" {
@@ -623,7 +696,7 @@ func handleStatus(cfg *Config) {
 		tailFile(cfg.LoggerFile, 10)
 	}
 
-	pid, appname, mode, err := readPID(cfg.pidFile)
+	pid, appname, mode, storedArgs, err := readPID(cfg.pidFile)
 	if appname != "" {
 		cfg.AppName = appname
 	}
@@ -640,8 +713,17 @@ func handleStatus(cfg *Config) {
 
 	if processExists(pid) {
 		fmt.Printf("Status: %s %s running (PID %d)\n", cfg.AppName, mode, pid)
-		if args, err := getProcessArgs(pid); err == nil {
-			fmt.Printf("Command: %s\n", strings.Join(args, " "))
+		// Prefer the command the daemon was launched with (from the PID file);
+		// the live /proc cmdline may differ if the process exec()ed into
+		// another program. Fall back to /proc for old PID files.
+		cmdArgs := storedArgs
+		if len(cmdArgs) == 0 {
+			if a, err := getProcessArgs(pid); err == nil {
+				cmdArgs = a
+			}
+		}
+		if len(cmdArgs) > 0 {
+			fmt.Printf("Command: %s\n", strings.Join(cmdArgs, " "))
 		}
 	} else {
 		fmt.Printf("Status: %s stopped\nBut process did not exit gracefully. Cleaning up.\n", cfg.AppName)
@@ -713,29 +795,51 @@ func mustExecutable() string {
 	return exe
 }
 
-func writePID(path string, pid int, appname, mode string) error {
-	return os.WriteFile(path, []byte(strconv.Itoa(pid)+"\n"+appname+"\n"+mode+"\n"), 0644)
+// PID file format, one field per line:
+//
+//	<pid>
+//	<appname>
+//	<mode>
+//	<arg0>\x00<arg1>\x00...   (the original command the daemon was launched with)
+//
+// The command args are NUL-separated — a byte that can never appear inside an
+// exec argument — so spaces and shell metacharacters survive intact. Storing
+// the launched command lets 'restart' relaunch it faithfully even after the
+// daemon has exec()ed into the target (and the target into something else,
+// e.g. bash tail-calling into sleep), which /proc/<pid>/cmdline no longer
+// reflects.
+func writePID(path string, pid int, appname, mode string, args []string) error {
+	content := strconv.Itoa(pid) + "\n" + appname + "\n" + mode + "\n" + strings.Join(args, "\x00") + "\n"
+	return os.WriteFile(path, []byte(content), 0644)
 }
 
-func readPID(path string) (int, string, string, error) {
+func readPID(path string) (pid int, appname, mode string, args []string, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return 0, "", "", err
+		return 0, "", "", nil, err
 	}
-	lines := strings.SplitN(strings.TrimSpace(string(data)), "\n", 3)
-	pid, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+	// Limit to 4 parts so the args blob keeps any embedded newlines; the fixed
+	// fields are parsed from the first three lines.
+	parts := strings.SplitN(string(data), "\n", 4)
+	pid, err = strconv.Atoi(strings.TrimSpace(parts[0]))
 	if err != nil {
-		return 0, "", "", err
+		return 0, "", "", nil, err
 	}
-	var appname string
-	if len(lines) > 1 {
-		appname = strings.TrimSpace(lines[1])
+	if len(parts) > 1 {
+		appname = strings.TrimSpace(parts[1])
 	}
-	mode := "start" // default for old PID files that don't have mode
-	if len(lines) > 2 {
-		mode = strings.TrimSpace(lines[2])
+	mode = "start" // default for old PID files that don't record a mode
+	if len(parts) > 2 {
+		if m := strings.TrimSpace(parts[2]); m != "" {
+			mode = m
+		}
 	}
-	return pid, appname, mode, nil
+	if len(parts) > 3 {
+		if blob := strings.TrimSuffix(parts[3], "\n"); blob != "" {
+			args = strings.Split(blob, "\x00")
+		}
+	}
+	return pid, appname, mode, args, nil
 }
 
 // processExists checks whether a process with the given PID is alive.

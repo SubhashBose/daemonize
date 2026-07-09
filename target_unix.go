@@ -14,21 +14,14 @@ import (
 // The PID (and thus the PID file) stays valid, and stop/reload signals reach
 // the target directly with no forwarding layer.
 //
-// In the plain-daemon role stdout/stderr are redirected to <pidfile>.log
-// first; in the watchdog-worker role they are already piped to the watchdog
-// log, so they are left alone.
+// Output redirection is handled by the daemon package: in the plain-daemon
+// role it redirects stdout/stderr to <pidfile>.log (DaemonOutputLog) before
+// calling this, and that redirection is inherited across the exec() below; in
+// the watchdog-worker role output is piped to the watchdog log.
 func runTarget(target []string) {
 	prog, err := exec.LookPath(target[0])
 	if err != nil {
 		log.Fatalf("daemonize: cannot find program %q: %v", target[0], err)
-	}
-
-	if pf := os.Getenv(pidFileEnvVar); pf != "" && os.Getenv(workerEnvVar) != "1" {
-		logPath := strings.TrimSuffix(pf, ".pid") + ".log"
-		if f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
-			dup2(int(f.Fd()), 1)
-			dup2(int(f.Fd()), 2)
-		}
 	}
 
 	// Strip our role markers so the target doesn't inherit them.
